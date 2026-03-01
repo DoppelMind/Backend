@@ -28,7 +28,6 @@ FastAPI backend for the doppelganger interrogation game.
 From `backend/`:
 
 ```bash
-cd backend/
 chmod +x setup.sh
 ./setup.sh
 source venv/bin/activate
