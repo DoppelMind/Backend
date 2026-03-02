@@ -4,51 +4,54 @@ import uuid
 import re
 import io
 import random
+import math
+import time
+import logging
 import unicodedata
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+
+
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import httpx
 from dotenv import load_dotenv
 
-from analysis_service import (
-    AnalyzeResponse,
-    AnalysisSummary,
-    ANALYZE_FALLBACK,
-    run_analysis,
-)
-
 load_dotenv()
-
-# ── Configuration ────────────────────────────────────────────────────────────
-
+logger = logging.getLogger("doppelmind")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-MISTRAL_MODEL = "mistral-small-latest"
+MISTRAL_MODEL = "mistral-large-latest"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
-
+MISTRAL_GAME_MODEL = os.getenv("MISTRAL_GAME_MODEL", "mistral-large-latest")
+VOXTRAL_MODEL = os.getenv("VOXTRAL_MODEL", "voxtral-mini-latest")
+VOXTRAL_API_URL = os.getenv("VOXTRAL_API_URL", "https://api.mistral.ai/v1/audio/transcriptions")
 
 VALID_EMOTIONS = {"calm", "nervous", "angry", "sad", "defensive", "confident", "fearful"}
 VALID_TONES = {"warm", "cold", "static"}
 
 SUS_SCAN_FALLBACK: dict = {
-    "narration": "The silence between words tells its own story.",
+    "narration": "Faltan detalles verificables frente a lo ya declarado.",
     "anomaly_delta": 0,
     "tone": "static",
-    "reason_tags": [],
+    "reason": "No hay suficiente evidencia nueva para confirmar coherencia.",
 }
+SCAN_MAX_USES = 3
+SCAN_COOLDOWN_SECONDS = 20
 
-# Set ENABLE_ANALYSIS=true in .env to append a suspicion analysis to every
-# interrogation response. Costs one extra Mistral call per question.
-ENABLE_ANALYSIS: bool = os.getenv("ENABLE_ANALYSIS", "false").lower() == "true"
 
-# ── Profanity filter (EN + ES) ────────────────────────────────────────────────
+def _normalise(text: str) -> str:
+    """Lowercase, strip combining diacritics, replace non-letters with spaces."""
+    nfd = unicodedata.normalize("NFD", text.lower())
+    stripped = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z]", " ", stripped)
+
+
 
 _PROFANITY: frozenset[str] = frozenset({
-    # English
     "fuck", "fucking", "fucker", "fucked", "fucks", "motherfucker", "motherfucking",
     "shit", "shitty", "shithead", "bullshit", "dipshit",
     "ass", "asshole", "asses", "jackass", "dumbass", "smartass",
@@ -86,14 +89,6 @@ _PROFANITY: frozenset[str] = frozenset({
     "zorra", "zorras",
     "idiota",
 })
-
-
-def _normalise(text: str) -> str:
-    """Lowercase, strip combining diacritics, replace non-letters with spaces."""
-    nfd = unicodedata.normalize("NFD", text.lower())
-    stripped = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
-    return re.sub(r"[^a-z]", " ", stripped)
-
 
 def _has_profanity(text: str) -> bool:
     """Return True if any word in *text* is in the profanity list."""
@@ -153,7 +148,7 @@ def _build_pressure_guidance(is_real: bool, questions_used: int) -> str:
         else:
             return (
                 "PRESSURE CONTEXT: The pressure is gradually building. "
-                "Maintaining the deception takes concentration; small cracks are forming. "
+                "Maintaining the deception takes concentration; large cracks are forming. "
                 "Preferred emotions for this moment: nervous, defensive. "
                 "Do NOT use angry — irritation would draw unwanted attention."
             )
@@ -334,6 +329,7 @@ async def call_mistral(
     messages: list[dict],
     json_mode: bool = False,
     temperature: float = 0.85,
+    model: str | None = None,
 ) -> str:
     if not MISTRAL_API_KEY:
         raise HTTPException(
@@ -346,7 +342,7 @@ async def call_mistral(
         "Content-Type": "application/json",
     }
     body: dict[str, Any] = {
-        "model": MISTRAL_MODEL,
+        "model": model or MISTRAL_MODEL,
         "messages": messages,
         "temperature": temperature,
     }
@@ -366,6 +362,74 @@ async def call_mistral(
             raise HTTPException(status_code=504, detail="Mistral API request timed out.")
 
     return resp.json()["choices"][0]["message"]["content"]
+
+
+async def call_voxtral_transcribe(
+    audio_bytes: bytes,
+    filename: str,
+    language: str,
+    content_type: str | None = None,
+) -> str:
+    lang = normalize_language(language)
+    msg_unavailable = (
+        "Speech transcription is unavailable. You can type your question manually."
+        if lang == "en"
+        else "No pudimos transcribir el audio. Puedes escribir tu pregunta manualmente."
+    )
+    msg_timeout = (
+        "Transcription took too long. Try again or type your question."
+        if lang == "en"
+        else "La transcripción tardó demasiado. Inténtalo de nuevo o escribe tu pregunta."
+    )
+    msg_unclear = (
+        "No clear voice was detected. Try recording again."
+        if lang == "en"
+        else "No se detectó voz clara en el audio. Intenta grabar de nuevo."
+    )
+
+    if not MISTRAL_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail=msg_unavailable,
+        )
+
+    files = {
+        "file": (
+            filename or "voice.webm",
+            audio_bytes,
+            content_type or "application/octet-stream",
+        )
+    }
+    data = {
+        "model": VOXTRAL_MODEL,
+        "language": normalize_language(language),
+    }
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}"}
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            resp = await client.post(VOXTRAL_API_URL, headers=headers, data=data, files=files)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.warning("voxtral http error: %s", e.response.text)
+            raise HTTPException(
+                status_code=502,
+                detail=msg_unavailable,
+            )
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=504,
+                detail=msg_timeout,
+            )
+
+    payload = resp.json() if resp.content else {}
+    text = str(payload.get("text") or payload.get("transcript") or "").strip()
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail=msg_unclear,
+        )
+    return text
 
 
 def extract_json(text: str) -> str:
@@ -511,8 +575,7 @@ class SusOScanResult(BaseModel):
     narration: str
     anomaly_delta: int
     tone: str
-    reason_tags: list[str]
-    sus_level: int
+    reason: str
 
 
 class InterrogateResponse(BaseModel):
@@ -521,8 +584,8 @@ class InterrogateResponse(BaseModel):
     questions_used: int
     questions_remaining: int
     emotion: str
-    analysis: AnalysisSummary | None = None
-    sus_scan: SusOScanResult | None = None
+    sus_scan: SusOScanResult
+    sus_level: int
 
 
 class AccuseRequest(BaseModel):
@@ -542,11 +605,8 @@ class NarrateRequest(BaseModel):
     text: str
     suspect_id: str = "1"
     emotion: str = "calm"
-
-
-class AnalyzeRequest(BaseModel):
-    game_id: str
-    suspect_id: str
+    sus_level: int = 5
+    tone: str = "static"
 
 
 class SuggestRequest(BaseModel):
@@ -554,10 +614,111 @@ class SuggestRequest(BaseModel):
     suspect_id: str
 
 
+class VoiceTranscribeResponse(BaseModel):
+    transcript: str
+
+
+class ScanHintResponse(BaseModel):
+    hint: str
+    tone: str
+    global_level: int
+    cooldown_seconds: int
+    uses_remaining: int
+
+
 def normalize_language(language: str | None) -> str:
     if language and language.lower() in {"es", "en"}:
         return language.lower()
     return "es"
+
+
+def _sanitize_sus_scan(payload: dict | None, current_level: int = 5) -> dict:
+    data = payload or {}
+    narration = str(data.get("narration") or "").strip() or SUS_SCAN_FALLBACK["narration"]
+    try:
+        delta = int(data.get("anomaly_delta", 0))
+    except Exception:
+        delta = 0
+    delta = max(-2, min(2, delta))
+    tone = str(data.get("tone") or "static").strip().lower()
+    if tone not in VALID_TONES:
+        tone = "static"
+    reason = str(data.get("reason") or "").strip() or SUS_SCAN_FALLBACK["reason"]
+    return {
+        "narration": narration,
+        "anomaly_delta": delta,
+        "tone": tone,
+        "reason": reason,
+    }
+
+
+def _global_sus_level(game: dict) -> int:
+    sus_levels = game.get("sus_level", {})
+    values = [max(0, min(10, int(sus_levels.get(sid, 5)))) for sid in ("1", "2", "3")]
+    return int(round(sum(values) / len(values)))
+
+
+def _build_scan_hint(language: str, tone: str, global_level: int, uses_remaining: int, cooling_down: bool) -> str:
+    if language == "es":
+        if uses_remaining <= 0:
+            return "La bateria del Sus-O-Scan esta agotada por ahora."
+        if cooling_down:
+            return "El escaner se recalibra; espera una lectura mas limpia."
+        if global_level >= 8:
+            return "La tension electrica sube en toda la sala."
+        if tone == "cold":
+            return "La señal se enfria; la historia mantiene coherencia."
+        if tone == "warm":
+            return "El pulso sube; algo no termina de encajar."
+        return "La señal oscila sin patron estable."
+    if uses_remaining <= 0:
+        return "Sus-O-Scan battery is drained for now."
+    if cooling_down:
+        return "The scanner is recalibrating; wait for a cleaner read."
+    if global_level >= 8:
+        return "Room-wide tension keeps climbing."
+    if tone == "cold":
+        return "Signal cools down; the story remains coherent."
+    if tone == "warm":
+        return "Pulse rises; something still does not align."
+    return "Signal wavers without a stable pattern."
+
+
+def _modulate_tts_text(text: str, sus_level: int, tone: str) -> str:
+    """
+    Adds subtle pacing/glitch texture without changing meaning.
+    """
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    if sus_level >= 6:
+        cleaned = re.sub(r"([,;:])\s*", r"\1 ... ", cleaned)
+    if sus_level >= 8:
+        cleaned = re.sub(r"([.!?])\s*", r"\1 ... ", cleaned)
+    if tone == "static" and sus_level >= 7:
+        words = cleaned.split()
+        for idx, word in enumerate(words):
+            plain = re.sub(r"[^A-Za-z]", "", word)
+            if len(plain) >= 6:
+                words[idx] = f"{word[0]}-{word}"
+                break
+        cleaned = " ".join(words)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _effective_emotion_for_tts(base_emotion: str, sus_level: int, tone: str) -> str:
+    emotion = str(base_emotion or "calm").strip().lower()
+    if emotion not in VALID_EMOTIONS:
+        emotion = "calm"
+    if tone == "warm" and sus_level >= 8:
+        return "fearful"
+    if tone == "warm" and sus_level >= 6:
+        return "nervous"
+    if tone == "cold" and sus_level <= 3:
+        return "calm"
+    if tone == "static" and sus_level >= 7:
+        return "defensive"
+    return emotion
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -667,13 +828,18 @@ RULES:
 - Return ONLY the raw JSON object"""
 
     # ── Generation with retry + fallback ─────────────────────────────────────
-    MAX_ATTEMPTS = 2
+    MAX_ATTEMPTS = 1
     game_data: dict | None = None
     validation_errors: list[str] = []
 
     for _ in range(MAX_ATTEMPTS):
         try:
-            raw = await call_mistral([{"role": "user", "content": prompt}], json_mode=True)
+            raw = await call_mistral(
+                [{"role": "user", "content": prompt}],
+                json_mode=True,
+                temperature=0.55,
+                model=MISTRAL_GAME_MODEL,
+            )
             candidate = json.loads(extract_json(raw))
         except json.JSONDecodeError as exc:
             validation_errors = [f"JSON parse error: {exc}"]
@@ -704,7 +870,13 @@ RULES:
         "interrogation_history": {},
         "questions_used": {"1": 0, "2": 0, "3": 0},
         "extra_unlocked": {"1": False, "2": False, "3": False},
-        "sus_level": {},
+        "sus_level": {"1": 5, "2": 5, "3": 5},
+        "sus_tone": {"1": "static", "2": "static", "3": "static"},
+        "scan_state": {
+            "1": {"uses_remaining": SCAN_MAX_USES, "next_at": 0.0},
+            "2": {"uses_remaining": SCAN_MAX_USES, "next_at": 0.0},
+            "3": {"uses_remaining": SCAN_MAX_USES, "next_at": 0.0},
+        },
         "game_over": False,
         "language": language,
     }
@@ -735,7 +907,7 @@ RULES:
         "suspects": public_suspects,
         "max_questions_per_suspect": MAX_QUESTIONS_PER_SUSPECT,
         "extra_questions_available": 2,
-        "model": MISTRAL_MODEL,
+        "model": MISTRAL_GAME_MODEL,
         "language": language,
     }
 
@@ -766,19 +938,22 @@ async def _run_sus_scan(
     transcript = "\n".join(transcript_lines) if transcript_lines else "(primer intercambio)"
 
     reqs = "\n".join(f"{i+1}. {r}" for i, r in enumerate(game_data["requirements"]))
+    public_alibi = ""
+    if isinstance(suspect.get("alibi"), dict):
+        public_alibi = str(suspect["alibi"].get("statement") or "").strip()
     lang_rule = (
-        "Write the narration in Spanish. Tags may be in English."
+        "Write narration and reason in Spanish."
         if game_language == "es"
-        else "Write the narration in English."
+        else "Write narration and reason in English."
     )
 
-    system_prompt = f"""You are Sus-O-Scan, a silent behavioral AI observing an interrogation.
+    system_prompt = f"""You are Sus-O-Scan, a forensic consistency checker.
 {lang_rule}
 
 CONTEXT:
 Case: {game_data['case']['description']}
 Suspect identity claimed: {suspect['name']}
-Public alibi: {suspect.get('public_alibi', 'none')}
+Public alibi: {public_alibi or "none"}
 Requirements the real person must fulfill:
 {reqs}
 
@@ -789,31 +964,31 @@ LATEST EXCHANGE:
 Detective: {question}
 {suspect['name']} [{emotion}]: {answer}
 
-Output ONLY valid JSON — no markdown, no explanation:
+Return ONLY valid strict JSON with this exact shape:
 {{
-  "narration": "<one atmospheric line, max 12 words, no spoilers, never say liar/fake/real/doppelganger>",
+  "narration": "<one short concrete clue sentence tied to this case>",
   "anomaly_delta": <integer -2 to +2>,
   "tone": "<warm|cold|static>",
-  "reason_tags": [<0 to 2 short behavioral micro-cues, 1-3 words each>]
+  "reason": "<one sentence explaining the concrete signal detected>"
 }}
 
 Rules:
+- Focus on coherence between latest answer, prior transcript, public alibi, and the 5 requirements.
+- Prefer concrete signals: times, places, named people, missing specifics, over-specific filler, or emotional shift.
+- No metaphors, no atmospheric fluff, no verdict words, and never reveal who is real.
+- Do not use these words in any language: liar, fake, real, doppelganger, culpable, mentiroso, verdadero, culpable.
+- narration and reason must be different sentences and each must be exactly one sentence.
 - anomaly_delta:
-    +2 = contradicts alibi, highly evasive, refuses to answer, very aggressive
-    +1 = suspicious hesitation, vague details, slight inconsistency
-     0 = neutral, answer neither helps nor hurts
-    -1 = coherent and calm, details fit the alibi well
-    -2 = very grounded, cooperative, consistent with all known facts
-- tone (CRITICAL — must match the suspect's emotional state and anomaly_delta):
-    warm  = suspect is nervous, defensive, angry, evasive, or emotionally agitated → RAISES suspicion
-    cold  = suspect is calm, cooperative, coherent, composed → LOWERS suspicion
-    static = signals are genuinely mixed or impossible to read
-- The detected emotion is "{emotion}". Use it as strong evidence:
-    angry/nervous/defensive/fearful → strongly lean toward warm
-    calm/confident/cooperative     → strongly lean toward cold
-    sad/ambiguous                  → lean toward static
-- CONSISTENCY RULE: tone="warm" requires anomaly_delta >= 0; tone="cold" requires anomaly_delta <= 0
-- narration must be cinematic and subtle — never a verdict"""
+    +2 strong inconsistency/omission
+    +1 mild inconsistency/omission
+     0 mixed or inconclusive
+    -1 mostly coherent with useful specifics
+    -2 highly coherent with verifiable specifics
+- tone:
+    warm = rising tension/evasive pattern
+    cold = stable coherent pattern
+    static = mixed signals
+- CONSISTENCY: warm requires anomaly_delta >= 0; cold requires anomaly_delta <= 0."""
 
     messages = [{"role": "system", "content": system_prompt}]
 
@@ -846,9 +1021,10 @@ Rules:
             if tone == "cold" and delta > 0:
                 delta = 0
 
-            tags = [str(t).strip() for t in (parsed.get("reason_tags") or []) if str(t).strip()][:2]
-
-            result = {"narration": narration, "anomaly_delta": delta, "tone": tone, "reason_tags": tags}
+            reason = str(parsed.get("reason") or "").strip()
+            if not reason:
+                raise ValueError("empty reason")
+            result = {"narration": narration, "anomaly_delta": delta, "tone": tone, "reason": reason}
             break
         except Exception:
             if attempt == 2:
@@ -858,12 +1034,12 @@ Rules:
         result = SUS_SCAN_FALLBACK.copy()
 
     sus_levels = game.setdefault("sus_level", {})
-    current = sus_levels.get(suspect["id"], 5)
+    current = max(0, min(10, int(sus_levels.get(suspect["id"], 5))))
     new_level = max(0, min(10, current + result["anomaly_delta"]))
     sus_levels[suspect["id"]] = new_level
-    result["sus_level"] = new_level
+    game.setdefault("sus_tone", {})[suspect["id"]] = result["tone"]
 
-    return result
+    return _sanitize_sus_scan(result, current_level=new_level)
 
 
 @app.post("/api/game/interrogate", response_model=InterrogateResponse)
@@ -978,24 +1154,8 @@ RULES:
 
     new_count = game["questions_used"][req.suspect_id]
 
-    # ── Optional inline analysis (ENABLE_ANALYSIS=true) ──────────────────────
-    # Runs after history is updated so it sees the latest Q&A.
-    # Any failure here is swallowed — the main game response is never affected.
-    analysis: AnalysisSummary | None = None
-    if ENABLE_ANALYSIS:
-        try:
-            ar = await run_analysis(game, suspect, game_data)
-            if ar is not None:
-                analysis = AnalysisSummary(
-                    suspicion_score=ar.suspicion_score,
-                    contradictions=ar.contradictions,
-                    recommendation=ar.recommendation,
-                )
-        except Exception:
-            pass
-
     # ── Sus-O-Scan ────────────────────────────────────────────────────────────
-    sus_scan: SusOScanResult | None = None
+    sus_scan_payload = _sanitize_sus_scan(None, current_level=game.get("sus_level", {}).get(req.suspect_id, 5))
     try:
         scan_dict = await _run_sus_scan(
             game=game,
@@ -1006,19 +1166,76 @@ RULES:
             emotion=emotion,
             game_language=game_language,
         )
-        sus_scan = SusOScanResult(**scan_dict)
+        sus_scan_payload = _sanitize_sus_scan(scan_dict, current_level=game.get("sus_level", {}).get(req.suspect_id, 5))
     except Exception:
-        pass
+        # Keep gameplay stable even if scan generation fails.
+        sus_levels = game.setdefault("sus_level", {})
+        stable_level = max(0, min(10, int(sus_levels.get(req.suspect_id, 5))))
+        sus_levels[req.suspect_id] = stable_level
+        sus_scan_payload = _sanitize_sus_scan(
+            SUS_SCAN_FALLBACK,
+            current_level=stable_level,
+        )
+
+    current_sus_level = max(0, min(10, int(game.get("sus_level", {}).get(req.suspect_id, 5))))
 
     return InterrogateResponse(
-        answer=answer,
+        answer=answer or ("..." if game_language == "en" else "..."),
         suspect_name=suspect["name"],
         questions_used=new_count,
         questions_remaining=MAX_QUESTIONS_PER_SUSPECT - new_count,
         emotion=emotion,
-        analysis=analysis,
-        sus_scan=sus_scan,
+        sus_scan=SusOScanResult(**sus_scan_payload),
+        sus_level=current_sus_level,
     )
+
+
+@app.post("/ask", response_model=InterrogateResponse)
+async def ask_alias(req: InterrogateRequest):
+    return await interrogate(req)
+
+
+@app.post("/api/game/interrogate/voice", response_model=VoiceTranscribeResponse)
+async def interrogate_voice(
+    audio: UploadFile = File(...),
+    language: str = Form("es"),
+):
+    lang = normalize_language(language)
+    content_type = (audio.content_type or "").lower()
+    filename = (audio.filename or "voice.webm").lower()
+    is_wav = "wav" in content_type or filename.endswith(".wav")
+    is_webm = "webm" in content_type or filename.endswith(".webm")
+    if not (is_wav or is_webm):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported format. Use WAV or WEBM audio."
+                if lang == "en"
+                else "Formato no compatible. Usa audio WAV o WEBM."
+            ),
+        )
+
+    try:
+        audio_bytes = await audio.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="El audio está vacío.")
+        transcript = await call_voxtral_transcribe(
+            audio_bytes=audio_bytes,
+            filename=audio.filename or "voice.webm",
+            language=lang,
+            content_type=audio.content_type,
+        )
+        return VoiceTranscribeResponse(transcript=transcript)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("voice transcription unexpected error: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail="No se pudo procesar el audio. Puedes escribir tu pregunta manualmente.",
+        )
+
+
 class UnlockRequest(BaseModel):
     game_id: str
     suspect_id: str
@@ -1054,9 +1271,9 @@ class SusOScanRequest(BaseModel):
     suspect_id: str
 
 
-@app.post("/api/game/susoscan/scan", response_model=SusOScanResult)
+@app.post("/api/game/susoscan/scan", response_model=ScanHintResponse)
 async def susoscan_on_demand(req: SusOScanRequest):
-    """On-demand Sus-O-Scan reading based on existing conversation history (no level change)."""
+    """On-demand Sus-O-Scan hint with cooldown and limited uses (no spoilers)."""
     game = games.get(req.game_id)
     if not game:
         raise HTTPException(status_code=404, detail="Game not found.")
@@ -1067,92 +1284,53 @@ async def susoscan_on_demand(req: SusOScanRequest):
     if not suspect:
         raise HTTPException(status_code=404, detail="Suspect not found.")
 
-    current_sus = game.get("sus_level", {}).get(req.suspect_id, 5)
-    history = game["interrogation_history"].get(req.suspect_id, [])
-
-    if not history:
-        narration_no_data = (
-            "La sala guarda silencio — aún no hay señales que leer."
-            if game_language == "es"
-            else "The room holds its breath — no signals to read yet."
-        )
-        return SusOScanResult(
-            narration=narration_no_data,
-            anomaly_delta=0,
-            tone="static",
-            reason_tags=[],
-            sus_level=current_sus,
-        )
-
-    transcript_lines = []
-    for entry in history:
-        label = "Detective" if entry["role"] == "user" else suspect["name"]
-        content = entry["content"]
-        if entry["role"] == "assistant":
-            try:
-                content = json.loads(content).get("answer", content)
-            except Exception:
-                pass
-        transcript_lines.append(f"{label}: {content}")
-    transcript = "\n".join(transcript_lines)
-
-    reqs = "\n".join(f"{i+1}. {r}" for i, r in enumerate(game_data["requirements"]))
-    lang_rule = (
-        "Write the narration in Spanish. Tags in English."
-        if game_language == "es"
-        else "Write the narration in English."
+    scan_state = game.setdefault("scan_state", {})
+    suspect_state = scan_state.setdefault(
+        req.suspect_id,
+        {"uses_remaining": SCAN_MAX_USES, "next_at": 0.0},
     )
 
-    system_prompt = f"""You are Sus-O-Scan performing an on-demand behavioral assessment.
-{lang_rule}
+    now = time.time()
+    next_at = float(suspect_state.get("next_at", 0.0) or 0.0)
+    uses_remaining = max(0, int(suspect_state.get("uses_remaining", SCAN_MAX_USES)))
+    cooldown_seconds = max(0, int(math.ceil(next_at - now)))
 
-Case: {game_data['case']['description']}
-Suspect: {suspect['name']} | Alibi: {suspect.get('public_alibi', 'none')}
-Requirements:
-{reqs}
-Current sus_level: {current_sus}/10
+    sus_tone = game.setdefault("sus_tone", {}).get(req.suspect_id, "static")
+    tone = sus_tone if sus_tone in VALID_TONES else "static"
+    global_level = _global_sus_level(game)
 
-Full conversation so far:
-{transcript}
+    if cooldown_seconds > 0:
+        hint = _build_scan_hint(game_language, tone, global_level, uses_remaining, True)
+        return ScanHintResponse(
+            hint=hint,
+            tone=tone,
+            global_level=global_level,
+            cooldown_seconds=cooldown_seconds,
+            uses_remaining=uses_remaining,
+        )
 
-Output ONLY valid JSON (no markdown):
-{{
-  "narration": "<atmospheric assessment, max 12 words, no spoilers, no verdict>",
-  "anomaly_delta": 0,
-  "tone": "<warm|cold|static>",
-  "reason_tags": [<0 to 2 behavioral micro-cues>]
-}}
-anomaly_delta MUST be 0 (read-only scan, no level change).
-tone rules:
-  warm  = suspect shows emotional heat across the conversation (nervous, angry, defensive, evasive) → raises suspicion
-  cold  = suspect appears calm, cooperative, coherent, consistent → lowers suspicion
-  static = signals are genuinely mixed or hard to read
-Assess the overall pattern of the full conversation above, not just the last message."""
+    if uses_remaining <= 0:
+        hint = _build_scan_hint(game_language, "static", global_level, 0, False)
+        return ScanHintResponse(
+            hint=hint,
+            tone="static",
+            global_level=global_level,
+            cooldown_seconds=0,
+            uses_remaining=0,
+        )
 
-    result: dict = SUS_SCAN_FALLBACK.copy()
-    for attempt in range(3):
-        try:
-            raw = await call_mistral(
-                [{"role": "system", "content": system_prompt}],
-                json_mode=True,
-                temperature=0.65,
-            )
-            parsed = json.loads(extract_json(raw))
-            narration = str(parsed.get("narration") or "").strip()
-            if not narration:
-                raise ValueError("empty narration")
-            tone = str(parsed.get("tone") or "static").lower()
-            if tone not in VALID_TONES:
-                tone = "static"
-            tags = [str(t).strip() for t in (parsed.get("reason_tags") or []) if str(t).strip()][:2]
-            result = {"narration": narration, "anomaly_delta": 0, "tone": tone, "reason_tags": tags}
-            break
-        except Exception:
-            if attempt == 2:
-                result = SUS_SCAN_FALLBACK.copy()
+    uses_remaining -= 1
+    suspect_state["uses_remaining"] = uses_remaining
+    suspect_state["next_at"] = now + SCAN_COOLDOWN_SECONDS
 
-    result["sus_level"] = current_sus
-    return SusOScanResult(**result)
+    hint = _build_scan_hint(game_language, tone, global_level, uses_remaining, False)
+    return ScanHintResponse(
+        hint=hint,
+        tone=tone,
+        global_level=global_level,
+        cooldown_seconds=SCAN_COOLDOWN_SECONDS,
+        uses_remaining=uses_remaining,
+    )
 
 
 @app.post("/api/game/accuse", response_model=AccuseResponse)
@@ -1203,8 +1381,14 @@ async def accuse(req: AccuseRequest):
 async def narrate(req: NarrateRequest):
     """Convert suspect answer to speech using ElevenLabs."""
     voice_id = SUSPECT_VOICES.get(req.suspect_id, SUSPECT_VOICES["1"])
-    settings = get_voice_settings(req.emotion, req.suspect_id)
-    audio_bytes = await call_elevenlabs(req.text, voice_id, settings)
+    sus_level = max(0, min(10, int(req.sus_level)))
+    tone = str(req.tone or "static").strip().lower()
+    if tone not in VALID_TONES:
+        tone = "static"
+    effective_emotion = _effective_emotion_for_tts(req.emotion, sus_level, tone)
+    settings = get_voice_settings(effective_emotion, req.suspect_id)
+    text = _modulate_tts_text(req.text, sus_level, tone) or req.text
+    audio_bytes = await call_elevenlabs(text, voice_id, settings)
     return StreamingResponse(
         io.BytesIO(audio_bytes),
         media_type="audio/mpeg",
@@ -1229,24 +1413,6 @@ async def game_status(game_id: str):
         },
         "max_questions_per_suspect": MAX_QUESTIONS_PER_SUSPECT,
     }
-
-
-@app.post("/api/game/analyze", response_model=AnalyzeResponse)
-async def analyze_suspect(req: AnalyzeRequest):
-    """
-    Analyze one suspect's interrogation history using Mistral.
-    Builds context exclusively from public game data (no hidden fields).
-    """
-    game = games.get(req.game_id)
-    if not game:
-        raise HTTPException(status_code=404, detail="Game not found.")
-
-    game_data = game["data"]
-    suspect = next((s for s in game_data["suspects"] if s["id"] == req.suspect_id), None)
-    if not suspect:
-        raise HTTPException(status_code=404, detail="Suspect not found.")
-
-    return await run_analysis(game, suspect, game_data) or ANALYZE_FALLBACK
 
 
 @app.post("/api/game/suggest")
@@ -1292,36 +1458,147 @@ async def suggest_question(req: SuggestRequest):
         if language == "es"
         else "Can you describe exactly where you were and who you were with at that time?"
     )
+    public_alibi = ""
+    if isinstance(suspect.get("alibi"), dict):
+        public_alibi = str(suspect["alibi"].get("statement") or "").strip()
+
+    context_blob = "\n".join(
+        [
+            str(case.get("setting") or ""),
+            str(case.get("victim") or ""),
+            str(case.get("time") or ""),
+            str(public_alibi or ""),
+            str(requirements_text or ""),
+            str(transcript or ""),
+        ]
+    )
+    stopwords = {
+        "the", "and", "with", "that", "this", "from", "your", "what", "when", "where", "were", "have",
+        "para", "como", "donde", "cuando", "sobre", "desde", "usted", "tiene", "esta", "este", "esa",
+        "ese", "porque", "quien", "quienes", "haber", "hacia", "entre", "despues", "antes",
+    }
+
+    def _context_tokens(text: str) -> set[str]:
+        return {
+            tok for tok in _normalise(text).split()
+            if len(tok) >= 4 and tok not in stopwords
+        }
+
+    ctx_tokens = _context_tokens(context_blob)
+
+    def _extract_suggestion(raw: str) -> str:
+        parsed = json.loads(extract_json(raw))
+        return str(parsed.get("suggested_question") or "").strip()
+
+    def _is_valid_suggestion(suggestion: str) -> tuple[bool, str]:
+        if not suggestion:
+            return False, "empty"
+        if not suggestion.endswith("?"):
+            return False, "missing_question_mark"
+        q_tokens = _context_tokens(suggestion)
+        if not (q_tokens & ctx_tokens):
+            return False, "no_context_overlap"
+        return True, "ok"
+
+    alibi_sample = public_alibi[:80] if public_alibi else ("sin coartada explícita" if language == "es" else "no explicit alibi")
+    good_example_1 = (
+        f"¿A las {case['time']}, quién puede confirmar que estabas en {case['setting']}?"
+        if language == "es"
+        else f"At {case['time']}, who can confirm you were at {case['setting']}?"
+    )
+    good_example_2 = (
+        f"En tu coartada mencionaste '{alibi_sample}'; ¿qué ocurrió justo antes?"
+        if language == "es"
+        else f"In your alibi you said '{alibi_sample}'; what happened right before that?"
+    )
 
     prompt = f"""Detective advisor. {lang_rule}
 
 CASE: {case['crime']} | Victim: {case['victim']} | When: {case['time']} | Where: {case['setting']}
+PUBLIC ALIBI (suspect): {public_alibi or "N/A"}
 
 REQUIREMENTS (only the real person satisfies all 5):
 {requirements_text}
 
-OPENING STATEMENT: {suspect['initial_statement']}
+OPENING STATEMENT (suspect): {suspect['initial_statement']}
 
 INTERROGATION SO FAR ({len(qa_pairs)} Q&A):
 {transcript}
 
 Generate ONE follow-up question the detective should ask next.
-Rules:
-- Target a gap, vagueness, or potential inconsistency in the alibi or requirements
-- Do NOT reveal the answer or make it obvious who is real or fake
-- One sentence, natural interrogation language, ends with ?
-- Output ONLY: {{"suggested_question": "..."}}"""
 
+HARD CONSTRAINTS (must follow):
+- The question MUST explicitly reference at least ONE concrete detail from case/public_alibi/requirements/transcript (time, place, person, object, event, or quoted phrase).
+- The focus MUST be verifying identity or alibi coherence within this case scenario and case time.
+- Do NOT introduce new/random topics.
+- Do NOT reveal who is real.
+- Exactly one sentence ending with "?".
+- Output ONLY strict JSON: {{"suggested_question":"..."}}
+
+BAD EXAMPLES (forbidden):
+- "What is your favorite planet in astronomy?"
+- "Do you practice guitar on weekends?"
+- "Who is your favorite football player?"
+
+GOOD EXAMPLES (desired style):
+- "{good_example_1}"
+- "{good_example_2}" """
+
+    raw_primary = ""
+    raw_repair = ""
     try:
-        raw     = await call_mistral(
+        raw_primary = await call_mistral(
             [{"role": "user", "content": prompt}], json_mode=True, temperature=0.6
         )
-        parsed  = json.loads(extract_json(raw))
-        suggestion = str(parsed.get("suggested_question") or "").strip()
-        if not suggestion or not suggestion.endswith("?"):
-            return {"suggested_question": fallback}
-        return {"suggested_question": suggestion}
+        suggestion = _extract_suggestion(raw_primary)
+        ok, reason = _is_valid_suggestion(suggestion)
+        if ok:
+            return {"suggested_question": suggestion}
+
+        repair_prompt = f"""Repair this output to satisfy all constraints. {lang_rule}
+
+CONTEXT:
+- Setting: {case['setting']}
+- Victim: {case['victim']}
+- Time: {case['time']}
+- Public alibi: {public_alibi or "N/A"}
+- Requirements:
+{requirements_text}
+- Transcript:
+{transcript}
+
+Validation failure: {reason}
+Previous raw output:
+{raw_primary}
+
+Return ONLY strict JSON: {{"suggested_question":"..."}}
+Rules:
+- One sentence ending with "?"
+- Must include at least one concrete word/entity from context
+- Must verify identity or alibi coherence in this case only"""
+
+        raw_repair = await call_mistral(
+            [{"role": "user", "content": repair_prompt}], json_mode=True, temperature=0.2
+        )
+        repaired = _extract_suggestion(raw_repair)
+        ok2, reason2 = _is_valid_suggestion(repaired)
+        if ok2:
+            return {"suggested_question": repaired}
+
+        logger.warning(
+            "suggest fallback used: reason=%s reason2=%s raw_primary=%r raw_repair=%r",
+            reason,
+            reason2,
+            raw_primary,
+            raw_repair,
+        )
+        return {"suggested_question": fallback}
     except Exception:
+        logger.warning(
+            "suggest fallback exception: raw_primary=%r raw_repair=%r",
+            raw_primary,
+            raw_repair,
+        )
         return {"suggested_question": fallback}
 
 
@@ -1330,7 +1607,20 @@ async def health():
     return {
         "status": "ok",
         "model": MISTRAL_MODEL,
+        "game_model": MISTRAL_GAME_MODEL,
         "api_key_configured": bool(MISTRAL_API_KEY),
         "elevenlabs_configured": bool(ELEVENLABS_API_KEY),
         "active_games": len(games),
     }
+
+
+
+@app.get("/api/test/mistral")
+async def test_mistral():
+    raw = await call_mistral(
+        [{"role": "user", "content": "Respond with ONLY: OK"}],
+        json_mode=False,
+        temperature=0
+    )
+    print("RAW RESPONSE:", raw)
+    return {"response": raw}

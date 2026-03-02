@@ -22,7 +22,7 @@ from pydantic import BaseModel
 # Reads the same env vars as main.py; no cross-module import needed.
 
 _API_KEY  = os.getenv("MISTRAL_API_KEY")
-_MODEL    = "mistral-small-latest"
+_MODEL    = "mistral-large-latest"
 _API_URL  = "https://api.mistral.ai/v1/chat/completions"
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
